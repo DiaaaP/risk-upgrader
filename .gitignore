@@ -1,0 +1,28 @@
+# Build output
+build/
+bin/
+obj/
+artifacts/
+dist/
+*.dll
+*.exe
+*.pdb
+*.mdb
+
+# Local game/config data
+*.cfg
+*.log
+SanaBuildOverlay-history.tsv
+SanaBuildOverlay-runs.tsv
+QuickItemsBuilds/
+
+# Backups and editor files
+*.bak
+*.user
+*.suo
+.vs/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+

@@ -1,0 +1,17 @@
+Risk Upgrader 0.3.0 — 2026-10-22
+
+Pure formula tests: PASS, 15 assertions.
+Production DLL: compiled cleanly against the installed Risk of Rain 2 assemblies.
+Installed path: C:\Program Files (x86)\Steam\steamapps\common\Risk of Rain 2\BepInEx\plugins\RiskUpgrader\RiskUpgrader.dll
+Installed SHA256: 75791D578AF08FE0078D4241738945AD73A0D67BEB66C9D25E6C9B659E7B598B
+UI: two honeycomb selection cards, live item icons, center wheel, single action row,
+and paged 10x3 inventory/target browser.
+Protection: server-side HiddenInvincibility for only the local host while UI is open;
+on close it becomes a 2.25-second timed shield and nearby enemies receive a
+non-damaging radial push. Pre-existing protection is preserved; allies are untouched.
+Empty state: wheel is initialized before selection, empty Image components stay hidden,
+and an empty inventory automatically opens the target catalog with explanatory text.
+Hallowed catalog: FoodTier, Hex, Page and Cursed are valued and accepted; hidden
+items are accepted as inputs when actually owned. DLC icons use Addressables handles.
+Runtime smoke test remains: launch a solo run, press F7, select input and target,
+then test one success/failure roll and verify F7/Escape restores camera input.
