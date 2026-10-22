@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using BepInEx;
 using BepInEx.Configuration;
 using RoR2;
+using RoR2.Networking;
 using RoR2.UI;
 using UnityEngine;
 using UnityEngine.EventSystems;
@@ -10,7 +11,7 @@ using UnityEngine.Networking;
 
 namespace RiskUpgrader
 {
-    [BepInPlugin("local.sana.ror2.riskupgrader", "Risk Upgrader", "0.3.0")]
+    [BepInPlugin("local.sana.ror2.riskupgrader", "Risk Upgrader", "0.4.0")]
     public sealed class RiskUpgraderPlugin : BaseUnityPlugin
     {
         private sealed class ItemChoice
@@ -27,6 +28,13 @@ namespace RiskUpgrader
         {
             public UnityEngine.UI.Image Image;
             public ItemChoice Choice;
+        }
+
+        private sealed class ServerProtection
+        {
+            public NetworkUser User;
+            public CharacterBody Body;
+            public bool AddedByUpgrader;
         }
 
         private ConfigEntry<KeyCode> toggleKey;
@@ -64,8 +72,6 @@ namespace RiskUpgrader
         private bool browsingTargets;
         private int browserPage;
         private const int BrowserPageSize = 30;
-        private CharacterBody protectedBody;
-        private bool protectionAdded;
         private readonly UpgraderIconManager iconManager = new UpgraderIconManager();
         private readonly List<IconBinding> visibleIconBindings = new List<IconBinding>();
         private float nextIconRefresh;
@@ -78,9 +84,18 @@ namespace RiskUpgrader
         private float spinDuration;
         private float spinEndTurns;
         private bool pendingSuccess;
-        private CharacterMaster pendingMaster;
         private ItemIndex pendingTarget;
         private int pendingOutputCount;
+        private bool awaitingServer;
+        private float requestSentAt;
+        private uint nextRequestId;
+        private uint pendingRequestId;
+        private bool serverSupportsMultiplayer;
+        private float nextHelloTime;
+        private NetworkClient registeredClient;
+        private bool serverHandlersRegistered;
+        private readonly Dictionary<int, float> nextAllowedRequestByConnection = new Dictionary<int, float>();
+        private readonly Dictionary<uint, ServerProtection> serverProtections = new Dictionary<uint, ServerProtection>();
         private readonly Color background = new Color(0.035f, 0.045f, 0.07f, 0.98f);
         private readonly Color surface = new Color(0.08f, 0.105f, 0.15f, 1f);
         private readonly Color raised = new Color(0.13f, 0.17f, 0.24f, 1f);
@@ -92,22 +107,30 @@ namespace RiskUpgrader
             toggleKey = Config.Bind("Controls", "ToggleKey", KeyCode.F7, "Open Risk Upgrader.");
             allowLunar = Config.Bind("Items", "AllowLunar", true, "Allow lunar items as inputs and targets.");
             allowVoid = Config.Bind("Items", "AllowVoid", true, "Allow void items as inputs and targets.");
-            protectWhileOpen = Config.Bind("Game", "ProtectWhileOpen", true, "Protect only the local host while the upgrader window is open.");
+            protectWhileOpen = Config.Bind("Game", "ProtectWhileOpen", true, "Protect the player operating the upgrader while its window is open.");
             exitProtectionSeconds = Config.Bind("Game", "ExitProtectionSeconds", 2.25f, "Invulnerability duration after closing the upgrader.");
             exitRepelRadius = Config.Bind("Game", "ExitRepelRadius", 18f, "Radius of the non-damaging enemy push when closing the upgrader.");
             exitRepelForce = Config.Bind("Game", "ExitRepelForce", 1800f, "Strength of the non-damaging enemy push when closing the upgrader.");
             spinSeconds = Config.Bind("Game", "SpinSeconds", 2.2f, "Wheel animation duration.");
-            Logger.LogInfo("Risk Upgrader 0.3.0 loaded. Safe exit, Hallowed tiers and asynchronous DLC icons enabled.");
+            EnsureNetworkHandlers();
+            Logger.LogInfo("Risk Upgrader 0.4.0 loaded. Server-authoritative multiplayer upgrades enabled.");
         }
 
         private void Update()
         {
             if (Input.GetKeyDown(toggleKey.Value)) SetOpen(!open);
             if (open && Input.GetKeyDown(KeyCode.Escape)) SetOpen(false);
-            if (open) MaintainProtection();
+            EnsureNetworkHandlers();
+            if (NetworkServer.active) MaintainServerProtections();
             if (open && Time.unscaledTime >= nextIconRefresh)
                 RefreshVisibleIcons();
             if (spinning) UpdateSpin();
+            if (awaitingServer && Time.unscaledTime - requestSentAt > 5f)
+            {
+                awaitingServer = false;
+                if (statusText != null) statusText.text = "Нет ответа от хоста — ему нужен Risk Upgrader 0.4.0";
+                if (rollButton != null) rollButton.interactable = true;
+            }
         }
 
         private void LateUpdate()
@@ -118,6 +141,7 @@ namespace RiskUpgrader
         private void SetOpen(bool value)
         {
             if (value && !RoR2Application.loadFinished) return;
+            EnsureNetworkHandlers();
             open = value;
             if (open)
             {
@@ -125,15 +149,12 @@ namespace RiskUpgrader
                 canvasObject.SetActive(true);
                 RefreshCatalog();
                 AcquireCursor();
-                MaintainProtection();
+                SendOperatorState(true);
             }
             else
             {
                 if (canvasObject != null) canvasObject.SetActive(false);
-                LocalUser localUser = LocalUserManager.GetFirstLocalUser();
-                CharacterBody body = protectedBody != null ? protectedBody : (localUser == null ? null : localUser.cachedBody);
-                RemoveProtection();
-                ApplyExitSafety(body);
+                SendOperatorState(false);
                 ReleaseCursor();
             }
         }
@@ -156,7 +177,7 @@ namespace RiskUpgrader
             panel.anchorMin = panel.anchorMax = panel.pivot = new Vector2(0.5f, 0.5f);
             panel.anchoredPosition = Vector2.zero;
             CreateText(panel, "RISK UPGRADER", 38, FontStyle.Bold, new Vector2(0f, 405f), new Vector2(1200f, 54f), Color.white, TextAnchor.MiddleCenter);
-            CreateText(panel, "F7 / ESC — закрыть    •    защита в окне + щит и импульс при выходе", 17, FontStyle.Normal, new Vector2(0f, 369f), new Vector2(1100f, 28f), new Color(0.7f, 0.75f, 0.82f), TextAnchor.MiddleCenter);
+            CreateText(panel, "F7 / ESC — закрыть    •    мультиплеер: мод нужен хосту и игроку", 17, FontStyle.Normal, new Vector2(0f, 369f), new Vector2(1100f, 28f), new Color(0.7f, 0.75f, 0.82f), TextAnchor.MiddleCenter);
 
             honeycombTexture = BuildHoneycombTexture();
             RectTransform inputCard = CreateCard(panel, "InputCard", new Vector2(-420f, 205f), accent);
@@ -235,7 +256,7 @@ namespace RiskUpgrader
             {
                 ItemIndex index = (ItemIndex)i;
                 ItemDef def = ItemCatalog.GetItemDef(index);
-                int owned = inventory.GetItemCountEffective(index);
+                int owned = inventory.GetItemCountPermanent(index);
                 if (!Allowed(def, owned > 0)) continue;
                 double value = UpgradeMath.TierValue(def.tier.ToString());
                 if (value <= 0d) continue;
@@ -382,7 +403,7 @@ namespace RiskUpgrader
             marker.gameObject.SetActive(true);
             inputIcon.preserveAspect = targetIcon.preserveAspect = true;
             statusText.text = selectedInput.Value.ToString("0.##") + " × " + inputCount + "  →  " + selectedTarget.Value.ToString("0.##") + " × " + outputCount;
-            rollButton.interactable = !spinning && selectedInput.Index != selectedTarget.Index && LocalInventory() != null && MaxOwned() >= inputCount;
+            rollButton.interactable = !spinning && !awaitingServer && selectedInput.Index != selectedTarget.Index && LocalInventory() != null && MaxOwned() >= inputCount;
             RebuildWheel(chance);
         }
 
@@ -395,7 +416,7 @@ namespace RiskUpgrader
         {
             if (selectedInput == null) return 1;
             Inventory inventory = LocalInventory();
-            return Math.Max(1, inventory == null ? selectedInput.Owned : inventory.GetItemCountEffective(selectedInput.Index));
+            return Math.Max(1, inventory == null ? selectedInput.Owned : inventory.GetItemCountPermanent(selectedInput.Index));
         }
 
         private Sprite GetChoiceIcon(ItemChoice choice)
@@ -434,34 +455,103 @@ namespace RiskUpgrader
 
         private void StartRoll()
         {
-            if (spinning || selectedInput == null || selectedTarget == null) return;
-            if (!NetworkServer.active)
+            if (spinning || awaitingServer || selectedInput == null || selectedTarget == null) return;
+            if (!NetworkServer.active && !serverSupportsMultiplayer)
             {
-                statusText.text = "Только соло или хост: бросок должен выполнить сервер";
+                statusText.text = "Хосту и игроку нужен Risk Upgrader 0.4.0";
                 return;
             }
             LocalUser user = LocalUserManager.GetFirstLocalUser();
             CharacterMaster master = user == null ? null : user.cachedMaster;
             Inventory inventory = master == null ? null : master.inventory;
-            if (inventory == null || inventory.GetItemCountEffective(selectedInput.Index) < inputCount)
+            NetworkUser networkUser = user == null ? null : user.currentNetworkUser;
+            if (inventory == null || networkUser == null || inventory.GetItemCountPermanent(selectedInput.Index) < inputCount)
             {
                 statusText.text = "Предметов уже недостаточно — список обновлён";
                 RefreshCatalog();
                 return;
             }
-            double chance = CurrentChance();
-            float roll = UnityEngine.Random.value;
-            pendingSuccess = roll < chance;
-            pendingMaster = master;
-            pendingTarget = selectedTarget.Index;
-            pendingOutputCount = outputCount;
-            inventory.RemoveItemPermanent(selectedInput.Index, inputCount);
+
+            nextRequestId++;
+            if (nextRequestId == 0u) nextRequestId = 1u;
+            pendingRequestId = nextRequestId;
+            UpgradeRequestMessage request = new UpgradeRequestMessage
+            {
+                protocolVersion = MultiplayerProtocol.Version,
+                requestId = pendingRequestId,
+                networkUserNetId = networkUser.netId.Value,
+                inputItemIndex = (int)selectedInput.Index,
+                targetItemIndex = (int)selectedTarget.Index,
+                inputCount = inputCount,
+                outputCount = outputCount
+            };
+
+            NetworkClient client = CurrentNetworkClient();
+            awaitingServer = true;
+            requestSentAt = Time.unscaledTime;
+            rollButton.interactable = false;
+            statusText.text = "ХОСТ ПРОВЕРЯЕТ СТАВКУ...";
+            if (client != null && client.isConnected)
+            {
+                if (!client.Send(MultiplayerProtocol.UpgradeRequestType, request))
+                {
+                    awaitingServer = false;
+                    statusText.text = "Не удалось отправить запрос хосту";
+                    rollButton.interactable = true;
+                }
+                return;
+            }
+
+            if (NetworkServer.active)
+            {
+                HandleResolvedUpgrade(ProcessServerUpgrade(networkUser, request));
+                return;
+            }
+
+            awaitingServer = false;
+            statusText.text = "Нет соединения с сервером";
+            rollButton.interactable = true;
+        }
+
+        private void HandleResolvedUpgrade(UpgradeResultMessage result)
+        {
+            if (result == null || result.requestId != pendingRequestId) return;
+            awaitingServer = false;
+            if (!result.accepted)
+            {
+                statusText.text = ErrorText(result.error);
+                RefreshCatalog();
+                return;
+            }
+
+            pendingSuccess = result.success;
+            pendingTarget = (ItemIndex)result.targetItemIndex;
+            pendingOutputCount = result.outputCount;
             spinning = true;
             spinStart = Time.unscaledTime;
             spinDuration = Mathf.Clamp(spinSeconds.Value, 0.5f, 6f);
-            spinEndTurns = 5f + roll;
+            spinEndTurns = 5f + Mathf.Clamp01(result.roll);
+            chanceText.text = (result.chance * 100f).ToString("0.0") + "%\n<color=#AAB7C8><size=16>ШАНС ХОСТА</size></color>";
+            RebuildWheel(result.chance);
             rollButton.interactable = false;
-            statusText.text = "КРУТИМ... вложение уже принято";
+            statusText.text = "КРУТИМ... хост принял вложение";
+        }
+
+        private static string ErrorText(UpgradeError error)
+        {
+            switch (error)
+            {
+                case UpgradeError.ProtocolMismatch: return "Версии мода не совпадают с хостом";
+                case UpgradeError.NotOwner: return "Хост отклонил чужой инвентарь";
+                case UpgradeError.NoRun: return "На сервере нет активного забега";
+                case UpgradeError.NoInventory: return "Хост не нашёл инвентарь игрока";
+                case UpgradeError.InvalidItems: return "Недопустимая пара предметов";
+                case UpgradeError.InvalidCount: return "Недопустимое количество предметов";
+                case UpgradeError.TargetUnavailable: return "Эта цель недоступна в текущем забеге";
+                case UpgradeError.InsufficientItems: return "Хост: предметов для ставки уже не хватает";
+                case UpgradeError.RateLimited: return "Слишком много запросов — подожди четверть секунды";
+                default: return "Хост отклонил запрос";
+            }
         }
 
         private void UpdateSpin()
@@ -471,20 +561,228 @@ namespace RiskUpgrader
             PositionMarker(spinEndTurns * 360f * eased);
             if (progress < 1f) return;
             spinning = false;
-            if (pendingSuccess && pendingMaster != null && pendingMaster.inventory != null)
+            if (pendingSuccess)
             {
-                pendingMaster.inventory.GiveItemPermanent(pendingTarget, pendingOutputCount);
                 ItemDef def = ItemCatalog.GetItemDef(pendingTarget);
                 statusText.text = "УСПЕХ! Получено: " + pendingOutputCount + " × " + (def == null ? pendingTarget.ToString() : Language.GetString(def.nameToken));
             }
             else statusText.text = "ПРОМАХ — вложенные предметы сгорели";
-            pendingMaster = null;
             Invoke("RefreshAfterRoll", 0.75f);
         }
 
         private void RefreshAfterRoll()
         {
             if (open) RefreshCatalog();
+        }
+
+        private static NetworkClient CurrentNetworkClient()
+        {
+            NetworkManagerSystem manager = NetworkManagerSystem.singleton;
+            return manager == null ? null : manager.client;
+        }
+
+        private void EnsureNetworkHandlers()
+        {
+            if (NetworkServer.active)
+            {
+                if (!serverHandlersRegistered
+                    || !NetworkServer.handlers.ContainsKey(MultiplayerProtocol.HelloRequestType)
+                    || !NetworkServer.handlers.ContainsKey(MultiplayerProtocol.UpgradeRequestType)
+                    || !NetworkServer.handlers.ContainsKey(MultiplayerProtocol.OperatorStateType))
+                {
+                    NetworkServer.RegisterHandler(MultiplayerProtocol.HelloRequestType, HandleServerHello);
+                    NetworkServer.RegisterHandler(MultiplayerProtocol.UpgradeRequestType, HandleServerUpgradeRequest);
+                    NetworkServer.RegisterHandler(MultiplayerProtocol.OperatorStateType, HandleServerOperatorState);
+                    serverHandlersRegistered = true;
+                    Logger.LogInfo("Risk Upgrader server handlers registered.");
+                }
+                serverSupportsMultiplayer = true;
+            }
+            else if (serverHandlersRegistered)
+            {
+                serverHandlersRegistered = false;
+                nextAllowedRequestByConnection.Clear();
+                ClearServerProtections(false);
+            }
+
+            NetworkClient client = CurrentNetworkClient();
+            if (client != registeredClient)
+            {
+                registeredClient = client;
+                serverSupportsMultiplayer = NetworkServer.active;
+                nextHelloTime = 0f;
+            }
+            if (client == null) return;
+
+            if (!client.handlers.ContainsKey(MultiplayerProtocol.HelloResponseType))
+                client.RegisterHandler(MultiplayerProtocol.HelloResponseType, HandleClientHello);
+            if (!client.handlers.ContainsKey(MultiplayerProtocol.UpgradeResultType))
+                client.RegisterHandler(MultiplayerProtocol.UpgradeResultType, HandleClientUpgradeResult);
+
+            if (!client.isConnected)
+            {
+                if (!NetworkServer.active) serverSupportsMultiplayer = false;
+                return;
+            }
+            if (!serverSupportsMultiplayer && Time.unscaledTime >= nextHelloTime)
+            {
+                client.Send(MultiplayerProtocol.HelloRequestType, new HelloMessage { protocolVersion = MultiplayerProtocol.Version });
+                nextHelloTime = Time.unscaledTime + 2f;
+            }
+        }
+
+        private void HandleServerHello(NetworkMessage netMsg)
+        {
+            HelloMessage request = netMsg.ReadMessage<HelloMessage>();
+            if (netMsg.conn == null) return;
+            netMsg.conn.Send(MultiplayerProtocol.HelloResponseType,
+                new HelloMessage { protocolVersion = request.protocolVersion == MultiplayerProtocol.Version ? MultiplayerProtocol.Version : -MultiplayerProtocol.Version });
+        }
+
+        private void HandleClientHello(NetworkMessage netMsg)
+        {
+            HelloMessage response = netMsg.ReadMessage<HelloMessage>();
+            serverSupportsMultiplayer = response.protocolVersion == MultiplayerProtocol.Version;
+            if (open && serverSupportsMultiplayer) SendOperatorState(true);
+            if (open && statusText != null && !spinning && !awaitingServer)
+                statusText.text = serverSupportsMultiplayer ? "Мультиплеер готов — бросок проверяет хост" : "Версия мода на хосте не совпадает";
+        }
+
+        private void HandleServerUpgradeRequest(NetworkMessage netMsg)
+        {
+            UpgradeRequestMessage request = netMsg.ReadMessage<UpgradeRequestMessage>();
+            UpgradeResultMessage response;
+            if (netMsg.conn == null)
+                return;
+
+            if (request.protocolVersion != MultiplayerProtocol.Version)
+            {
+                netMsg.conn.Send(MultiplayerProtocol.UpgradeResultType,
+                    Rejected(request.requestId, UpgradeError.ProtocolMismatch));
+                return;
+            }
+
+            float nextAllowed;
+            if (nextAllowedRequestByConnection.TryGetValue(netMsg.conn.connectionId, out nextAllowed) && Time.unscaledTime < nextAllowed)
+            {
+                response = Rejected(request.requestId, UpgradeError.RateLimited);
+            }
+            else
+            {
+                nextAllowedRequestByConnection[netMsg.conn.connectionId] = Time.unscaledTime + 0.25f;
+                NetworkUser user = FindOwnedNetworkUser(netMsg.conn, request.networkUserNetId);
+                response = user == null ? Rejected(request.requestId, UpgradeError.NotOwner) : ProcessServerUpgrade(user, request);
+            }
+            netMsg.conn.Send(MultiplayerProtocol.UpgradeResultType, response);
+        }
+
+        private void HandleClientUpgradeResult(NetworkMessage netMsg)
+        {
+            HandleResolvedUpgrade(netMsg.ReadMessage<UpgradeResultMessage>());
+        }
+
+        private UpgradeResultMessage ProcessServerUpgrade(NetworkUser user, UpgradeRequestMessage request)
+        {
+            if (!NetworkServer.active) return Rejected(request.requestId, UpgradeError.NoRun);
+            if (Run.instance == null) return Rejected(request.requestId, UpgradeError.NoRun);
+            if (user == null || user.master == null || user.master.inventory == null)
+                return Rejected(request.requestId, UpgradeError.NoInventory);
+            if (request.inputCount <= 0 || request.inputCount > 1000000 || !AllowedOutputCount(request.outputCount))
+                return Rejected(request.requestId, UpgradeError.InvalidCount);
+            if (request.inputItemIndex < 0 || request.inputItemIndex >= ItemCatalog.itemCount
+                || request.targetItemIndex < 0 || request.targetItemIndex >= ItemCatalog.itemCount
+                || request.inputItemIndex == request.targetItemIndex)
+                return Rejected(request.requestId, UpgradeError.InvalidItems);
+
+            ItemIndex inputIndex = (ItemIndex)request.inputItemIndex;
+            ItemIndex targetIndex = (ItemIndex)request.targetItemIndex;
+            ItemDef inputDef = ItemCatalog.GetItemDef(inputIndex);
+            ItemDef targetDef = ItemCatalog.GetItemDef(targetIndex);
+            if (!Allowed(inputDef, true) || !Allowed(targetDef, false) || targetDef.hidden)
+                return Rejected(request.requestId, UpgradeError.InvalidItems);
+
+            string targetTier = targetDef.tier.ToString();
+            if (!Run.instance.availableItems.Contains(targetIndex) && !IsHallowedTier(targetTier))
+                return Rejected(request.requestId, UpgradeError.TargetUnavailable);
+
+            Inventory inventory = user.master.inventory;
+            if (inventory.GetItemCountPermanent(inputIndex) < request.inputCount)
+                return Rejected(request.requestId, UpgradeError.InsufficientItems);
+
+            double inputValue = UpgradeMath.TierValue(inputDef.tier.ToString());
+            double targetValue = UpgradeMath.TierValue(targetTier);
+            double chance = UpgradeMath.Chance(inputValue, request.inputCount, targetValue, request.outputCount);
+            if (chance <= 0d) return Rejected(request.requestId, UpgradeError.InvalidItems);
+
+            float roll = UnityEngine.Random.value;
+            bool success = roll < chance;
+            inventory.RemoveItemPermanent(inputIndex, request.inputCount);
+            if (success) inventory.GiveItemPermanent(targetIndex, request.outputCount);
+            Logger.LogInfo("Upgrade request " + request.requestId + " for " + user.userName + ": "
+                + inputDef.name + " x" + request.inputCount + " -> " + targetDef.name + " x" + request.outputCount
+                + ", chance=" + chance.ToString("0.000") + ", success=" + success);
+            return new UpgradeResultMessage
+            {
+                requestId = request.requestId,
+                accepted = true,
+                success = success,
+                roll = roll,
+                chance = (float)chance,
+                targetItemIndex = request.targetItemIndex,
+                outputCount = request.outputCount,
+                error = UpgradeError.None
+            };
+        }
+
+        private static bool AllowedOutputCount(int count)
+        {
+            return count == 1 || count == 2 || count == 4 || count == 8;
+        }
+
+        private static UpgradeResultMessage Rejected(uint requestId, UpgradeError error)
+        {
+            return new UpgradeResultMessage { requestId = requestId, accepted = false, error = error };
+        }
+
+        private static NetworkUser FindOwnedNetworkUser(NetworkConnection connection, uint networkUserNetId)
+        {
+            if (connection == null) return null;
+            foreach (NetworkUser user in NetworkUser.readOnlyInstancesList)
+            {
+                if (user == null || user.netId.Value != networkUserNetId) continue;
+                NetworkConnection owner = user.connectionToClient;
+                if (owner == connection || (owner != null && owner.connectionId == connection.connectionId))
+                    return user;
+            }
+            return null;
+        }
+
+        private void SendOperatorState(bool isOpen)
+        {
+            LocalUser localUser = LocalUserManager.GetFirstLocalUser();
+            NetworkUser networkUser = localUser == null ? null : localUser.currentNetworkUser;
+            if (networkUser == null) return;
+            OperatorStateMessage message = new OperatorStateMessage
+            {
+                protocolVersion = MultiplayerProtocol.Version,
+                networkUserNetId = networkUser.netId.Value,
+                isOpen = isOpen
+            };
+            NetworkClient client = CurrentNetworkClient();
+            if (client != null && client.isConnected)
+            {
+                client.Send(MultiplayerProtocol.OperatorStateType, message);
+                return;
+            }
+            if (NetworkServer.active) SetServerProtection(networkUser, isOpen);
+        }
+
+        private void HandleServerOperatorState(NetworkMessage netMsg)
+        {
+            OperatorStateMessage message = netMsg.ReadMessage<OperatorStateMessage>();
+            if (message.protocolVersion != MultiplayerProtocol.Version) return;
+            NetworkUser user = FindOwnedNetworkUser(netMsg.conn, message.networkUserNetId);
+            if (user != null) SetServerProtection(user, message.isOpen);
         }
 
         private Inventory LocalInventory()
@@ -529,42 +827,99 @@ namespace RiskUpgrader
             marker.localRotation = Quaternion.Euler(0f, 0f, -degrees);
         }
 
-        private void MaintainProtection()
+        private void SetServerProtection(NetworkUser user, bool isOpen)
         {
-            if (protectWhileOpen == null || !protectWhileOpen.Value || !NetworkServer.active)
+            if (!NetworkServer.active || user == null) return;
+            uint key = user.netId.Value;
+            ServerProtection state;
+            if (!isOpen)
             {
-                RemoveProtection();
-                return;
-            }
-            LocalUser user = LocalUserManager.GetFirstLocalUser();
-            CharacterBody body = user == null ? null : user.cachedBody;
-            if (body == protectedBody)
-            {
-                if (body != null && RoR2Content.Buffs.HiddenInvincibility != null
-                    && !body.HasBuff(RoR2Content.Buffs.HiddenInvincibility))
+                CharacterBody exitBody = user.GetCurrentBody();
+                if (serverProtections.TryGetValue(key, out state))
                 {
-                    body.AddBuff(RoR2Content.Buffs.HiddenInvincibility);
-                    protectionAdded = true;
+                    if (state.Body != null) exitBody = state.Body;
+                    RemoveServerProtection(state);
+                    serverProtections.Remove(key);
                 }
+                ApplyExitSafety(exitBody);
                 return;
             }
-            RemoveProtection();
-            protectedBody = body;
-            if (protectedBody != null && RoR2Content.Buffs.HiddenInvincibility != null
-                && !protectedBody.HasBuff(RoR2Content.Buffs.HiddenInvincibility))
+
+            if (protectWhileOpen == null || !protectWhileOpen.Value) return;
+            if (!serverProtections.TryGetValue(key, out state))
             {
-                protectedBody.AddBuff(RoR2Content.Buffs.HiddenInvincibility);
-                protectionAdded = true;
+                state = new ServerProtection { User = user };
+                serverProtections.Add(key, state);
+            }
+            UpdateServerProtectionBody(state, user.GetCurrentBody());
+        }
+
+        private void MaintainServerProtections()
+        {
+            if (protectWhileOpen == null || !protectWhileOpen.Value)
+            {
+                ClearServerProtections(false);
+                return;
+            }
+            if (serverProtections.Count == 0) return;
+            List<uint> stale = null;
+            foreach (KeyValuePair<uint, ServerProtection> pair in serverProtections)
+            {
+                ServerProtection state = pair.Value;
+                if (state == null || state.User == null)
+                {
+                    if (stale == null) stale = new List<uint>();
+                    stale.Add(pair.Key);
+                    continue;
+                }
+                UpdateServerProtectionBody(state, state.User.GetCurrentBody());
+            }
+            if (stale == null) return;
+            for (int i = 0; i < stale.Count; i++)
+            {
+                ServerProtection state;
+                if (serverProtections.TryGetValue(stale[i], out state)) RemoveServerProtection(state);
+                serverProtections.Remove(stale[i]);
             }
         }
 
-        private void RemoveProtection()
+        private static void UpdateServerProtectionBody(ServerProtection state, CharacterBody body)
         {
-            if (protectionAdded && protectedBody != null && RoR2Content.Buffs.HiddenInvincibility != null
-                && protectedBody.HasBuff(RoR2Content.Buffs.HiddenInvincibility))
-                protectedBody.RemoveBuff(RoR2Content.Buffs.HiddenInvincibility);
-            protectionAdded = false;
-            protectedBody = null;
+            if (state.Body != body)
+            {
+                RemoveServerProtection(state);
+                state.Body = body;
+            }
+            if (state.Body != null && RoR2Content.Buffs.HiddenInvincibility != null
+                && !state.Body.HasBuff(RoR2Content.Buffs.HiddenInvincibility))
+            {
+                state.Body.AddBuff(RoR2Content.Buffs.HiddenInvincibility);
+                state.AddedByUpgrader = true;
+            }
+        }
+
+        private static void RemoveServerProtection(ServerProtection state)
+        {
+            if (state != null && state.AddedByUpgrader && state.Body != null
+                && RoR2Content.Buffs.HiddenInvincibility != null
+                && state.Body.HasBuff(RoR2Content.Buffs.HiddenInvincibility))
+                state.Body.RemoveBuff(RoR2Content.Buffs.HiddenInvincibility);
+            if (state != null)
+            {
+                state.AddedByUpgrader = false;
+                state.Body = null;
+            }
+        }
+
+        private void ClearServerProtections(bool applyExitSafety)
+        {
+            foreach (ServerProtection state in serverProtections.Values)
+            {
+                CharacterBody body = state == null ? null : state.Body;
+                RemoveServerProtection(state);
+                if (applyExitSafety) ApplyExitSafety(body);
+            }
+            serverProtections.Clear();
         }
 
         private void ApplyExitSafety(CharacterBody operatorBody)
@@ -636,7 +991,19 @@ namespace RiskUpgrader
 
         private void OnDestroy()
         {
-            RemoveProtection();
+            if (open) SendOperatorState(false);
+            ClearServerProtections(false);
+            if (NetworkServer.active)
+            {
+                NetworkServer.UnregisterHandler(MultiplayerProtocol.HelloRequestType);
+                NetworkServer.UnregisterHandler(MultiplayerProtocol.UpgradeRequestType);
+                NetworkServer.UnregisterHandler(MultiplayerProtocol.OperatorStateType);
+            }
+            if (registeredClient != null)
+            {
+                registeredClient.UnregisterHandler(MultiplayerProtocol.HelloResponseType);
+                registeredClient.UnregisterHandler(MultiplayerProtocol.UpgradeResultType);
+            }
             ReleaseCursor();
             iconManager.Dispose();
             if (wheelTexture != null) Destroy(wheelTexture);

@@ -18,6 +18,7 @@ foreach($name in @('netstandard.dll','System.Runtime.dll')) { $candidate=Join-Pa
 $arguments = @('/nologo','/target:library',('/out:'+$output))
 foreach($reference in ($references | Select-Object -Unique)){ $arguments += '/reference:'+$reference }
 $arguments += (Join-Path $root 'UpgradeMath.cs')
+$arguments += (Join-Path $root 'MultiplayerProtocol.cs')
 $arguments += (Join-Path $root 'UpgraderIconManager.cs')
 $arguments += (Join-Path $root 'RiskUpgraderPlugin.cs')
 & $compiler @arguments

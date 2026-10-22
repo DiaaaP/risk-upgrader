@@ -1,17 +1,20 @@
-Risk Upgrader 0.3.0 — 2026-10-22
+Risk Upgrader 0.4.0 — 2026-10-22
 
 Pure formula tests: PASS, 15 assertions.
+Protocol serialization tests: PASS, 19 assertions.
 Production DLL: compiled cleanly against the installed Risk of Rain 2 assemblies.
-Installed path: C:\Program Files (x86)\Steam\steamapps\common\Risk of Rain 2\BepInEx\plugins\RiskUpgrader\RiskUpgrader.dll
-Installed SHA256: 75791D578AF08FE0078D4241738945AD73A0D67BEB66C9D25E6C9B659E7B598B
+Build SHA256: 54A9D43A3DDA4FEF26EA5A3E3D102B7EC99F73262310D765F718151CAAD52437
 UI: two honeycomb selection cards, live item icons, center wheel, single action row,
 and paged 10x3 inventory/target browser.
-Protection: server-side HiddenInvincibility for only the local host while UI is open;
+Protection: server-side HiddenInvincibility for the authenticated operating player while UI is open;
+Multiplayer: custom HLAPI handshake plus server-authoritative request/result flow;
+Ownership: server accepts inventory mutations only for a NetworkUser owned by the requesting connection;
+Validation: protocol, item ids, counts, availability, ownership and rate limit checked by host;
 on close it becomes a 2.25-second timed shield and nearby enemies receive a
 non-damaging radial push. Pre-existing protection is preserved; allies are untouched.
 Empty state: wheel is initialized before selection, empty Image components stay hidden,
 and an empty inventory automatically opens the target catalog with explanatory text.
 Hallowed catalog: FoodTier, Hex, Page and Cursed are valued and accepted; hidden
 items are accepted as inputs when actually owned. DLC icons use Addressables handles.
-Runtime smoke test remains: launch a solo run, press F7, select input and target,
-then test one success/failure roll and verify F7/Escape restores camera input.
+Runtime smoke test remains: use two game clients with 0.4.0, let the remote client
+open F7 and roll once, then verify both inventories and the remote player's exit protection.

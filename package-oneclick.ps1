@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 & (Join-Path $root 'build.ps1')
 
-$modVersion = '0.3.0'
+$modVersion = '0.4.0'
 $pluginName = 'RiskUpgrader'
 $pluginDll = Join-Path $root 'build\RiskUpgrader.dll'
 $bepInExVersion = '5.4.23.5'
